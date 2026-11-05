@@ -25,6 +25,9 @@ namespace graphics::internal {
 
 namespace {
 
+// Эти ресурсы общие для приложения и живут от initialize() до shutdown().
+// Приложение рисует одним command buffer, а ImGui записывает свой поверх
+// того же изображения swapchain отдельным проходом.
 VkInstance vk_instance;
 uint32_t vk_api_version;
 VkSurfaceKHR vk_surface;
@@ -58,8 +61,10 @@ std::vector<VkFramebuffer> vk_imgui_framebuffers;
 VkCommandPool vk_imgui_command_pool;
 VkCommandBuffer vk_imgui_command_buffer;
 
+// Буфер глубины должен поддерживать использование в depth/stencil attachment.
+// Сначала пробуем исходный формат D24S8, затем D32S8; при отсутствии обоих
+// инициализация прерывается до создания render pass.
 VkFormat selectDepthFormat(VkPhysicalDevice physical_device) {
-	// Prefer the original format and preserve stencil support in the fallback.
 	const VkFormat candidates[] = {
 		VK_FORMAT_D24_UNORM_S8_UINT,
 		VK_FORMAT_D32_SFLOAT_S8_UINT,
@@ -77,6 +82,9 @@ VkFormat selectDepthFormat(VkPhysicalDevice physical_device) {
 }
 
 bool initializeImGUI() {
+	// Для интерфейса нужны собственные дескрипторы и render pass. Он
+	// загружает уже нарисованный сценой цвет (LOAD), рисует элементы ImGui
+	// поверх него и переводит изображение в состояние для показа (PRESENT).
 	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
 		{
 			.type = VK_DESCRIPTOR_TYPE_SAMPLER,
@@ -125,6 +133,8 @@ bool initializeImGUI() {
 	};
 
 	const VkSubpassDependency render_pass_dependency = {
+		// Сцена записывает цвет до того, как проход ImGui начнёт читать
+		// и перезаписывать то же изображение swapchain.
 		.srcSubpass = VK_SUBPASS_EXTERNAL,
 		.dstSubpass = 0,
 		.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -153,6 +163,8 @@ bool initializeImGUI() {
 
 	const uint32_t swapchain_images_count = uint32_t(vk_swapchain_images.size());
 
+	// Для каждого изображения swapchain создаётся framebuffer ImGui.
+	// Индекс кадра выбирается позже в prepare() через vkAcquireNextImageKHR.
 	vk_imgui_framebuffers.resize(swapchain_images_count);
 
 	VkFramebufferCreateInfo framebuffer = {
@@ -175,6 +187,8 @@ bool initializeImGUI() {
 	}
 
 	const VkCommandPoolCreateInfo command_pool = {
+		// Команды ImGui записываются заново в каждом кадре, поэтому pool
+		// разрешает сбрасывать выделенный из него command buffer.
 		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
 		.queueFamilyIndex = context.graphics_queue_index,
@@ -200,6 +214,8 @@ bool initializeImGUI() {
 	}
 
 	ImGui_ImplVulkan_InitInfo init = {
+		// Backend ImGui использует уже созданные instance, device, очередь
+		// и render pass. Отдельный Vulkan context для UI не создаётся.
 		.ApiVersion = vk_api_version,
 		.Instance = vk_instance,
 		.PhysicalDevice = context.physical_device,
@@ -218,6 +234,9 @@ bool initializeImGUI() {
 }
 
 void drawImGUI() {
+	// UI записывается после команд сцены и будет отправлен в ту же очередь.
+	// Собственный render pass сохраняет пиксели сцены и добавляет к ним
+	// подготовленные в main() данные ImGui::Render().
 	vkResetCommandBuffer(vk_imgui_command_buffer, 0);
 
 	const VkCommandBufferBeginInfo command_buffer_begin = {
@@ -244,6 +263,8 @@ void drawImGUI() {
 }
 
 bool rebuildSwapchain(uint32_t width, uint32_t height) {
+	// Размер изображения поменялся. Сначала ждём окончания работы GPU,
+	// чтобы старые framebuffer, image view и depth image больше не читались.
 	vkQueueWaitIdle(context.graphics_queue);
 
 	vkb::SwapchainBuilder sb(context.physical_device, context.device, vk_surface,
@@ -261,6 +282,9 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 
 	auto vkb_swapchain = sb_result.value();
 
+	// Новый swapchain построен с передачей старого в set_old_swapchain().
+	// После этого освобождаем зависящие от размера старые представления
+	// изображений и framebuffer, затем сохраняем новые изображения.
 	for (size_t i = 0, n = vk_swapchain_image_views.size(); i < n; ++i) {
 		vkDestroyFramebuffer(context.device, vk_imgui_framebuffers[i], nullptr);
 		vkDestroyFramebuffer(context.device, vk_framebuffers[i], nullptr);
@@ -279,6 +303,8 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 	vk_swapchain_images = std::move(swapchain_images);
 	vk_swapchain_image_views = std::move(swapchain_image_views);
 
+	// Буфер глубины имеет тот же размер, что и цветовое изображение;
+	// поэтому при resize он создаётся заново вместе с его image view.
 	vkDestroyImageView(context.device, vk_image_view_depth_buffer, nullptr);
 	vmaDestroyImage(context.allocator, vk_image_depth_buffer, vma_allocation_depth_buffer);
 
@@ -346,6 +372,8 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 
 	vk_framebuffers.resize(swapchain_images_count);
 
+	// Проход сцены пишет цвет и глубину, поэтому каждому framebuffer
+	// нужны представление текущего изображения и общее представление глубины.
 	for (uint32_t i = 0; i < swapchain_images_count; ++i) {
 		framebuffer_attachments[0] = vk_swapchain_image_views[i];
 
@@ -358,6 +386,7 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 
 	vk_imgui_framebuffers.resize(swapchain_images_count);
 
+	// Проход интерфейса пишет только цвет поверх уже готовой сцены.
 	VkFramebufferCreateInfo imgui_framebuffer = {
 		.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
 		.renderPass = vk_imgui_render_pass,
@@ -387,6 +416,8 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 Context context;
 
 bool initialize(GLFWwindow* const window) {
+	// vk-bootstrap упрощает выбор instance, физического устройства и
+	// swapchain. Поверхность GLFW связывает окно с Vulkan для показа кадров.
 	vkb::InstanceBuilder ib;
 
 	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 1, 0))
@@ -416,6 +447,8 @@ bool initialize(GLFWwindow* const window) {
 
 	auto vkb_physical_device = pds_result.value();
 
+	// Формат глубины выбирается до render pass: оба должны использовать
+	// одинаковый VkFormat, иначе framebuffer будет несовместим с проходом.
 	vk_depth_buffer_format = selectDepthFormat(vkb_physical_device.physical_device);
 	if (vk_depth_buffer_format == VK_FORMAT_UNDEFINED) {
 		std::cerr << "No supported depth/stencil attachment format found\n";
@@ -432,6 +465,8 @@ bool initialize(GLFWwindow* const window) {
 
 	auto vkb_device = db_result.value();
 
+	// Графическая очередь одновременно отправляет команды сцены и ImGui.
+	// Её индекс нужен также при создании обоих command pool.
 	context.physical_device = vkb_device.physical_device;
 	context.device = vkb_device.device;
 
@@ -450,6 +485,8 @@ bool initialize(GLFWwindow* const window) {
 	}
 
 	const VmaAllocatorCreateInfo allocator = {
+		// VMA использует выбранное физическое устройство и логический device
+		// для выделения памяти буферов приложения и изображения глубины.
 		.physicalDevice = context.physical_device,
 		.device = context.device,
 		.instance = vk_instance,
@@ -474,15 +511,21 @@ bool initialize(GLFWwindow* const window) {
 
 	auto vkb_swapchain = sb_result.value();
 
+	// Swapchain хранит несколько изображений для показа. Их количество,
+	// формат и размер определяются выбранным устройством и поверхностью.
 	vk_swapchain = vkb_swapchain.swapchain;
 	context.swapchain_format = vkb_swapchain.image_format;
 	context.swapchain_extent = vkb_swapchain.extent;
 	vk_swapchain_images = vkb_swapchain.get_images().value();
 	vk_swapchain_image_views = vkb_swapchain.get_image_views().value();
 	vk_swapchain_current_image = UINT32_MAX;
+	vk_swapchain_resize_width = context.swapchain_extent.width;
+	vk_swapchain_resize_height = context.swapchain_extent.height;
 
 	const uint32_t swapchain_images_count = uint32_t(vk_swapchain_images.size());
 
+	// Одно изображение глубины используется для текущего кадра. Поскольку
+	// кадры синхронизированы одним fence, одновременно в него не пишут.
 	const VkImageCreateInfo depth_buffer = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.imageType = VK_IMAGE_TYPE_2D,
@@ -529,6 +572,8 @@ bool initialize(GLFWwindow* const window) {
 	}
 
 	const VkAttachmentDescription render_pass_attachments[] = {
+		// Сцена очищает цвет и глубину перед отрисовкой фигуры. Цвет после
+		// прохода остаётся доступным следующему проходу интерфейса ImGui.
 		{
 			.format = context.swapchain_format,
 			.samples = VK_SAMPLE_COUNT_1_BIT,
@@ -598,6 +643,8 @@ bool initialize(GLFWwindow* const window) {
 
 	vk_framebuffers.resize(swapchain_images_count);
 
+	// Для каждого swapchain image создаётся framebuffer прохода сцены.
+	// Представление глубины при этом общее для всех кадров.
 	for (uint32_t i = 0; i < swapchain_images_count; ++i) {
 		framebuffer_attachments[0] = vk_swapchain_image_views[i];
 
@@ -610,6 +657,10 @@ bool initialize(GLFWwindow* const window) {
 
 	const VkSemaphoreCreateInfo semaphore = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
 
+	// Semaphore связывают получение изображения, завершение рисования
+	// и показ. Fence нужен CPU: он подтверждает завершение прошлого кадра,
+	// прежде чем приложение обновит общий uniform-буфер и команды.
+	// Изначально fence сигнальный, чтобы первый кадр не ждал несуществующий.
 	const VkFenceCreateInfo fence = {
 		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
 		.flags = VK_FENCE_CREATE_SIGNALED_BIT,
@@ -637,6 +688,7 @@ bool initialize(GLFWwindow* const window) {
 	}
 
 	const VkCommandPoolCreateInfo command_pool = {
+		// Сцена перезаписывает один primary command buffer каждый кадр.
 		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
 		.queueFamilyIndex = context.graphics_queue_index,
@@ -668,6 +720,8 @@ bool initialize(GLFWwindow* const window) {
 }
 
 void shutdown() {
+	// Прежде чем освобождать ресурсы, завершаем все отправленные GPU
+	// команды. Затем удаляем ресурсы ImGui, сцены, swapchain и device.
 	vkQueueWaitIdle(context.graphics_queue);
 
 	ImGui_ImplVulkan_Shutdown();
@@ -709,6 +763,9 @@ void shutdown() {
 }
 
 void resize(uint32_t width, uint32_t height) {
+	// GLFW может сообщить нулевой размер свёрнутого окна. Запоминаем
+	// только ненулевые размеры; swapchain будет перестроен после показа
+	// текущего кадра либо при следующем запросе изображения.
 	if (width == 0 || height == 0) {
 		return;
 	}
@@ -720,9 +777,14 @@ void resize(uint32_t width, uint32_t height) {
 }
 
 FrameData prepare() {
+	// Используется один набор ресурсов кадра и один fence. Ожидание
+	// гарантирует, что предыдущая отправка завершилась до перезаписи
+	// command buffer и uniform-буфера приложением.
 	vkWaitForFences(context.device, 1, &vk_fence_frame_in_flight, VK_TRUE, UINT64_MAX);
 
 retry_acquire:
+	// Получаем индекс изображения, свободного для записи. Если swapchain
+	// устарел из-за resize, пересоздаём его и повторяем получение.
 	switch (vkAcquireNextImageKHR(context.device, vk_swapchain, UINT64_MAX,
 								  vk_semaphore_image_available, VK_NULL_HANDLE,
 								  &vk_swapchain_current_image)) {
@@ -742,6 +804,7 @@ retry_acquire:
 		return {};
 	}
 
+	// Fence снова станет сигнальным после vkQueueSubmit текущего кадра.
 	vkResetFences(context.device, 1, &vk_fence_frame_in_flight);
 
 	return {
@@ -751,6 +814,8 @@ retry_acquire:
 }
 
 void submitAndPresent() {
+	// Команды интерфейса записываются после сцены, но отправляются вместе
+	// с ней одним vkQueueSubmit и в указанном порядке command buffer.
 	drawImGUI();
 
 	const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -772,6 +837,8 @@ void submitAndPresent() {
 
 	vkQueueSubmit(context.graphics_queue, 1, &submit, vk_fence_frame_in_flight);
 
+	// Показ ждёт semaphore завершённого рисования. Если поверхность
+	// изменила размер или swapchain устарел, создаём изображения заново.
 	const VkPresentInfoKHR present = {
 		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
 		.waitSemaphoreCount = 1,
@@ -786,7 +853,7 @@ void submitAndPresent() {
 	    result == VK_SUBOPTIMAL_KHR ||
 	    vk_swapchain_resize_require) {
 		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
-	} else {
+	} else if (result != VK_SUCCESS) {
 		std::cerr << "Failed to present Vulkan swapchain image\n";
 	}
 }

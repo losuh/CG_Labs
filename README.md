@@ -1,6 +1,15 @@
-# 🌋 Vulkan Starter App
+# CG Lab #1 — Truncated Regular Tetrahedron
 
-## Getting started
+Простая учебная реализация варианта 4: усечённый правильный тетраэдр с четырьмя треугольными и четырьмя шестиугольными гранями. Код намеренно повторяет примеры из лекций. Подробный план находится в [LAB1_PLAN.md](LAB1_PLAN.md).
+
+Управление:
+
+- `W/A/S/D` — вращение;
+- `P` — перспективная/ортографическая проекция;
+
+## Сборка и запуск
+
+### Требования к окружению
 
 You need C++ compiler, Vulkan SDK and CMake installed before you can build this project.
 
